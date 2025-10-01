@@ -89,14 +89,20 @@ def _parse_dayfirst_numeric(s: str) -> str:
 
 def normalize_date(s: str) -> str:
     """Convert many date spellings into ISO (UTC) for comparison."""
-    if not s: return ""
+    if not s:
+        return ""
     s = s.strip()
+
+    # Strip leading weekday names like "Thursday," or "Thu"
+    s = re.sub(r'^(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?),?\s+', '', s, flags=re.I)
+
     # ISO-like
     try:
         dt = datetime.fromisoformat(s.replace("Z","+00:00"))
         return to_iso(dt)
     except Exception:
         pass
+
     # Common formats
     for fmt in ("%Y-%m-%d", "%d %B %Y", "%d %b %Y", "%b %d, %Y", "%B %d, %Y", "%Y/%m/%d"):
         try:
@@ -104,6 +110,7 @@ def normalize_date(s: str) -> str:
             return to_iso(dt)
         except Exception:
             pass
+
     # Month Year -> assume 1st of month
     m = re.search(r"([A-Za-z]{3,9})\s+(\d{4})", s)
     if m:
@@ -112,14 +119,18 @@ def normalize_date(s: str) -> str:
         if mon in MONTHS:
             dt = datetime(int(m.group(2)), MONTHS[mon]+1, 1, tzinfo=timezone.utc)
             return to_iso(dt)
+
     # yyyy-mm-dd anywhere
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=timezone.utc)
         return to_iso(dt)
+
     # dd/mm/yyyy or dd.mm.yyyy or dd-mm-yyyy
     val = _parse_dayfirst_numeric(s)
-    if val: return val
+    if val:
+        return val
+
     return ""
 
 # ------------------ Date extraction ------------------
@@ -141,14 +152,17 @@ META_PUBLISHED = [
 ]
 
 # Visible text (generic)
+WEEKDAY_OPT = r'(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\s+'
+DATE_CORE   = r'(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})'
+
 VISIBLE_UPDATED_GENERIC = [
-    re.compile(r'\bLast\s*updated\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
-    re.compile(r'\bPage\s*last\s*updated\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
-    re.compile(r'\bLast\s*reviewed\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
-    re.compile(r'\bReviewed\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
-    re.compile(r'\bUpdated\s*(?:on)?\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
-    re.compile(r'\bCurrent\s+as\s+at\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
-    re.compile(r'\bLast\s*(?:changed|revised|modified)\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
+    re.compile(rf'\bLast\s*updated\b[:\s-]*(?:{WEEKDAY_OPT})?({DATE_CORE})', re.I),
+    re.compile(rf'\bPage\s*last\s*updated\b[:\s-]*(?:{WEEKDAY_OPT})?({DATE_CORE})', re.I),
+    re.compile(rf'\bLast\s*reviewed\b[:\s-]*(?:{WEEKDAY_OPT})?({DATE_CORE})', re.I),
+    re.compile(rf'\bReviewed\b[:\s-]*(?:{WEEKDAY_OPT})?({DATE_CORE})', re.I),
+    re.compile(rf'\bUpdated\s*(?:on)?\b[:\s-]*(?:{WEEKDAY_OPT})?({DATE_CORE})', re.I),
+    re.compile(rf'\bCurrent\s+as\s+at\b[:\s-]*(?:{WEEKDAY_OPT})?({DATE_CORE})', re.I),
+    re.compile(rf'\bLast\s*(?:changed|revised|modified)\b[:\s-]*(?:{WEEKDAY_OPT})?({DATE_CORE})', re.I),
 ]
 
 # Fallback script-key search (for pages that stash dates in JS)
@@ -222,9 +236,14 @@ def extract_dates(html: str, url: str):
 
     # NSW Health – "Current as at"
     if "health.nsw.gov.au" in host:
-        find_html(re.compile(r'Current\s+as\s+at[^<:]*[:>]\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:NSW:current-as-at", "high")
-        find_html(re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified", "high")
-        find_html(re.compile(r'<meta[^>]+name=["\']dcterms\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DCTERMS.modified", "high")
+    # Allow optional weekday before the actual date
+    weekday_opt = r'(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\s+'
+    date_core = r'(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})'
+    find_html(re.compile(rf'Current\s+as\s+at[^<:]*[:>]\s*(?:{weekday_opt})?({date_core})', re.I),
+              "text:NSW:current-as-at", "high")
+    # Meta fallbacks
+    find_html(re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified", "high")
+    find_html(re.compile(r'<meta[^>]+name=["\']dcterms\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DCTERMS.modified", "high")
 
     # RACGP
     if "racgp.org.au" in host:
