@@ -87,14 +87,20 @@ def _parse_dayfirst_numeric(s: str) -> str:
                 return ""
     return ""
 
+# ---------- CHANGE #1: Smarter normalize_date (strips weekday prefixes) ----------
 def normalize_date(s: str) -> str:
-    ""Convert many date spellings into ISO (UTC) for comparison."""
+    """Convert many date spellings into ISO (UTC) for comparison."""
     if not s:
         return ""
     s = s.strip()
 
-    # Strip leading weekday names like "Thursday," or "Thu"
-    s = re.sub(r'^(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?),?\s+', '', s, flags=re.I)
+    # Strip leading weekday names like "Thursday" or "Thu,"
+    s = re.sub(
+        r'^(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?),?\s+',
+        '',
+        s,
+        flags=re.I
+    )
 
     # ISO-like
     try:
@@ -145,13 +151,14 @@ META_UPDATED = [
     (re.compile(r'<meta[^>]+name=["\']dcterms\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DCTERMS.modified"),
     (re.compile(r'<meta[^>]+name=["\']DC\.Date\.Modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DC.Date.Modified"),
 ]
+# Make published meta patterns consistent with group index
 META_PUBLISHED = [
-    re.compile(r'<meta[^>]+(itemprop|name|property)=["\']datePublished["\'][^>]+content=["\']([^"\']+)["\']', re.I),
-    re.compile(r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']', re.I),
-    re.compile(r'<meta[^>]+name=["\']dc\.date["\'][^>]+content=["\']([^"\']+)["\']', re.I),
+    (re.compile(r'<meta[^>]+(itemprop|name|property)=["\']datePublished["\'][^>]+content=["\']([^"\']+)["\']', re.I), 2),
+    (re.compile(r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']', re.I), 1),
+    (re.compile(r'<meta[^>]+name=["\']dc\.date["\'][^>]+content=["\']([^"\']+)["\']', re.I), 1),
 ]
 
-# Visible text (generic)
+# ---------- CHANGE #3: Generic visible-text patterns with optional weekday ----------
 WEEKDAY_OPT = r'(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\s+'
 DATE_CORE   = r'(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})'
 
@@ -195,11 +202,11 @@ def extract_dates(html: str, url: str):
         m = rx.search(html)
         if m:
             updated = normalize_date(m.group(1)); source = src; confidence = "high"; break
-    for rx in META_PUBLISHED:
+    for rx, gi in META_PUBLISHED:
         if not published:
             m = rx.search(html)
             if m:
-                published = normalize_date(m.group(1 if rx is META_PUBLISHED[1] else (2 if rx is META_PUBLISHED[0] else 1)))
+                published = normalize_date(m.group(gi))
 
     # 2) JSON-LD (high)
     if ("application/ld+json" in html) and (not updated or not published):
@@ -234,24 +241,20 @@ def extract_dates(html: str, url: str):
                     source = source or src
                     confidence = confidence or conf
 
-    # NSW Health – "Current as at"
+    # ---------- CHANGE #2: NSW Health – "Current as at" with optional weekday ----------
     if "health.nsw.gov.au" in host:
-    # Allow optional weekday before the actual date
-    weekday_opt = r'(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\s+'
-    date_core = r'(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})'
-    find_html(re.compile(rf'Current\s+as\s+at[^<:]*[:>]\s*(?:{weekday_opt})?({date_core})', re.I),
-              "text:NSW:current-as-at", "high")
-    # Meta fallbacks
-    find_html(re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified", "high")
-    find_html(re.compile(r'<meta[^>]+name=["\']dcterms\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DCTERMS.modified", "high")
+        weekday_opt = r'(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\s+'
+        date_core = DATE_CORE
+        find_html(re.compile(rf'Current\s+as\s+at[^<:]*[:>]\s*(?:{weekday_opt})?({date_core})', re.I),
+                  "text:NSW:current-as-at", "high")
+        # Meta fallbacks
+        find_html(re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified", "high")
+        find_html(re.compile(r'<meta[^>]+name=["\']dcterms\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DCTERMS.modified", "high")
 
-    # RACGP
+    # Some other commonly handled sites (kept brief; generic fallback covers many):
     if "racgp.org.au" in host:
         find_html(re.compile(r'(Last\s*updated|Reviewed)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:RACGP", "medium")
         find_html(re.compile(r'<meta[^>]+name=["\']last-modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:last-modified", "high")
-
-    # Healthdirect/SA/ACI/eviQ/NICE/WHO/CDC/HETI/Monash/eTG (same as before but numeric dates allowed)
-    # ... (reuse your previous patterns if needed; generic fallback will usually catch)
 
     # 4) Plain-text fallbacks (handles split tags)
     if not updated and text:
@@ -260,9 +263,11 @@ def extract_dates(html: str, url: str):
             if m:
                 updated = normalize_date(m.group(1))
                 if updated:
-                    lab = rx.pattern.split("\\b")[1].lower().replace("\\s*", " ").replace("\\s+", " ")
-                    source = source or f"text:{lab}"
-                    confidence = confidence or ("high" if "updated" in lab or "current as at" in lab else "medium")
+                    # derive a human source label from the regex pattern's first keyword
+                    label_match = re.search(r'\\b([A-Za-z ]+?)\\b', rx.pattern)
+                    label = (label_match.group(1) if label_match else "text:last-updated").lower().strip()
+                    source = source or f"text:{label}"
+                    confidence = confidence or ("high" if "updated" in label or "current as at" in label else "medium")
                     break
 
     # 5) <time datetime="..."> with 'updated/reviewed' context nearby
@@ -307,7 +312,7 @@ def should_render(host: str, html_text: str) -> bool:
     # Heuristics: SPA shells or instructions to enable scripts
     if re.search(r'\bLoading\.\.\.|enable\s+scripts|this\s+site\s+requires\s+javascript', html_text or "", flags=re.I):
         return True
-    # If nothing found by simple HTML (later we call when dates missing)
+    # If nothing found by simple HTML (we call only when dates missing anyway)
     return True
 
 def render_html_playwright(url: str, timeout_ms: int = 25000) -> str:
