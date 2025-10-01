@@ -88,7 +88,7 @@ def _parse_dayfirst_numeric(s: str) -> str:
     return ""
 
 def normalize_date(s: str) -> str:
-    """Convert many date spellings into ISO (UTC) for comparison."""
+    ""Convert many date spellings into ISO (UTC) for comparison."""
     if not s:
         return ""
     s = s.strip()
