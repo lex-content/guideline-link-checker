@@ -3,7 +3,7 @@ name: Link checker (Google Sheet)
 on:
   workflow_dispatch: {}
   schedule:
-    # Runs daily at ~03:00 Australia/Melbourne (≈ 16:00 UTC the previous day; adjust if DST shifts)
+    # ~03:00 Australia/Melbourne (≈ 16:00 UTC previous day; adjust if DST shifts)
     - cron: "0 16 * * *"
 
 concurrency:
@@ -23,6 +23,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Install Playwright browser (for JS-rendered pages)
+        run: |
+          python -m playwright install --with-deps chromium
       - name: Write service account JSON
         run: |
           echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > sa.json
@@ -32,9 +35,13 @@ jobs:
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SHEET_NAME: Sheet1
-          MAX_WORKERS: "6"
-          GOV_TIMEOUT: "30"
-          BASE_TIMEOUT: "15"
+          # Rendering toggles
+          USE_PLAYWRIGHT: "1"
+          RENDER_DOMAINS: "health.gov.au,health.nsw.gov.au,racgp.org.au,comorbidityguidelines.org.au,alcoholtreatmentguidelines.com.au"
+          # Networking
+          MAX_WORKERS: "4"          # when rendering is on, keep this modest
+          GOV_TIMEOUT: "40"         # per-request seconds (*.gov.au)
+          BASE_TIMEOUT: "20"        # per-request seconds (others)
         run: |
           python checker.py --sheet "$SHEET_ID" --tab "$SHEET_NAME" \
             --workers "$MAX_WORKERS" --gov-timeout "$GOV_TIMEOUT" --base-timeout "$BASE_TIMEOUT"
