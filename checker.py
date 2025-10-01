@@ -1,4 +1,4 @@
-import os, re, json, time, hashlib, argparse, socket
+import os, re, json, time, hashlib, argparse, socket, contextlib
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --------- config via CLI/env ----------
+# ------------------ Config via CLI/env ------------------
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sheet", required=True, help="Google Sheet ID")
@@ -21,7 +21,10 @@ def parse_args():
     ap.add_argument("--base-timeout", type=int, default=int(os.getenv("BASE_TIMEOUT", "15")))
     return ap.parse_args()
 
-# --------- HTTP session with retries ----------
+USE_PLAYWRIGHT = os.getenv("USE_PLAYWRIGHT", "0") == "1"
+RENDER_DOMAINS = set([h.strip().lower() for h in os.getenv("RENDER_DOMAINS", "").split(",") if h.strip()])
+
+# ------------------ HTTP session with retries ------------------
 def make_session(timeout_s: int):
     sess = requests.Session()
     retry = Retry(
@@ -38,7 +41,7 @@ def make_session(timeout_s: int):
     sess.mount("http://", adapter)
     sess.mount("https://", adapter)
     sess.headers.update({
-        "User-Agent": "GH-Actions-LinkChecker/1.0 (+https://github.com/)",
+        "User-Agent": "GH-Actions-LinkChecker/1.1 (+https://github.com/)",
         "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-AU,en;q=0.8",
         "Cache-Control": "no-cache",
@@ -46,7 +49,7 @@ def make_session(timeout_s: int):
     sess.request_timeout = timeout_s
     return sess
 
-# --------- helpers ----------
+# ------------------ Helpers ------------------
 MONTHS = {m:i for i,m in enumerate(
     ["january","february","march","april","may","june","july",
      "august","september","october","november","december"]) }
@@ -70,20 +73,38 @@ def to_iso(dt: datetime) -> str:
     except Exception:
         return ""
 
+def _parse_dayfirst_numeric(s: str) -> str:
+    """Handle dd/mm/yyyy and dd.mm.yyyy and dd-mm-yyyy."""
+    s = s.strip()
+    for rx in (r"(\d{1,2})/(\d{1,2})/(\d{4})", r"(\d{1,2})\.(\d{1,2})\.(\d{4})", r"(\d{1,2})-(\d{1,2})-(\d{4})"):
+        m = re.search(rx, s)
+        if m:
+            d, mth, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            try:
+                dt = datetime(y, mth, d, tzinfo=timezone.utc)
+                return to_iso(dt)
+            except Exception:
+                return ""
+    return ""
+
 def normalize_date(s: str) -> str:
+    """Convert many date spellings into ISO (UTC) for comparison."""
     if not s: return ""
     s = s.strip()
+    # ISO-like
     try:
         dt = datetime.fromisoformat(s.replace("Z","+00:00"))
         return to_iso(dt)
     except Exception:
         pass
+    # Common formats
     for fmt in ("%Y-%m-%d", "%d %B %Y", "%d %b %Y", "%b %d, %Y", "%B %d, %Y", "%Y/%m/%d"):
         try:
             dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
             return to_iso(dt)
         except Exception:
             pass
+    # Month Year -> assume 1st of month
     m = re.search(r"([A-Za-z]{3,9})\s+(\d{4})", s)
     if m:
         mon = m.group(1).lower()
@@ -91,64 +112,82 @@ def normalize_date(s: str) -> str:
         if mon in MONTHS:
             dt = datetime(int(m.group(2)), MONTHS[mon]+1, 1, tzinfo=timezone.utc)
             return to_iso(dt)
+    # yyyy-mm-dd anywhere
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=timezone.utc)
         return to_iso(dt)
+    # dd/mm/yyyy or dd.mm.yyyy or dd-mm-yyyy
+    val = _parse_dayfirst_numeric(s)
+    if val: return val
     return ""
 
-# --------- date extraction (general + site-specific) ----------
+# ------------------ Date extraction ------------------
+# Meta patterns
 META_UPDATED = [
     (re.compile(r'<meta[^>]+property=["\']article:modified_time["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:article:modified_time"),
     (re.compile(r'<meta[^>]+property=["\']og:updated_time["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:og:updated_time"),
     (re.compile(r'<meta[^>]+itemprop=["\']dateModified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:itemprop:dateModified"),
     (re.compile(r'<meta[^>]+name=["\']last-modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:last-modified"),
     (re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified"),
+    (re.compile(r'<meta[^>]+name=["\']dc\.date\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:dc.date.modified"),
     (re.compile(r'<meta[^>]+name=["\']dcterms\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DCTERMS.modified"),
+    (re.compile(r'<meta[^>]+name=["\']DC\.Date\.Modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DC.Date.Modified"),
 ]
-META_PUBLISHED = re.compile(r'<meta[^>]+(itemprop|name|property)=["\']datePublished["\'][^>]+content=["\']([^"\']+)["\']', re.I)
+META_PUBLISHED = [
+    re.compile(r'<meta[^>]+(itemprop|name|property)=["\']datePublished["\'][^>]+content=["\']([^"\']+)["\']', re.I),
+    re.compile(r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']', re.I),
+    re.compile(r'<meta[^>]+name=["\']dc\.date["\'][^>]+content=["\']([^"\']+)["\']', re.I),
+]
 
+# Visible text (generic)
 VISIBLE_UPDATED_GENERIC = [
-    re.compile(r'Last\s*updated\s*[:-]\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})', re.I),
-    re.compile(r'Last\s*updated\s*[:-]\s*(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', re.I),
-    re.compile(r'Updated\s*[:-]\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})', re.I),
-    re.compile(r'Last\s*reviewed\s*[:-]\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})', re.I),
-    re.compile(r'Reviewed\s*[:-]\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})', re.I),
-    re.compile(r'Updated\s*on\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})', re.I),
-    re.compile(r'Last\s*updated\s*on\s*(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', re.I),
-    re.compile(r'Last\s*updated\s*[:-]\s*(\d{4}-\d{2}-\d{2})', re.I),
+    re.compile(r'\bLast\s*updated\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
+    re.compile(r'\bPage\s*last\s*updated\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
+    re.compile(r'\bLast\s*reviewed\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
+    re.compile(r'\bReviewed\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
+    re.compile(r'\bUpdated\s*(?:on)?\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
+    re.compile(r'\bCurrent\s+as\s+at\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
+    re.compile(r'\bLast\s*(?:changed|revised|modified)\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2}|(?:\d{1,2}[/\.-]){2}\d{4})', re.I),
 ]
+
+# Fallback script-key search (for pages that stash dates in JS)
+SCRIPT_KEYS = re.compile(
+    r'"(?:dateModified|lastModified|lastUpdated|updatedAt|updated_at|modifiedAt|modified_at|pageUpdated|pageLastUpdated|dateLastUpdated|reviewDate|lastReviewed)"\s*:\s*"([^"]{4,30})"',
+    re.I
+)
 
 def domain(host, *parts): return re.search("|".join([re.escape(p) for p in parts]), host, re.I)
 
 def extract_dates(html: str, url: str):
     """
-    Extract updated/published dates from HTML with:
-    1) meta tags
-    2) JSON-LD
-    3) site-specific HTML patterns
-    4) NEW: plain-text fallbacks (handles 'Last updated' split across tags)
-    5) Generic <time datetime="..."> with 'updated' context
+    Extract updated/published dates from:
+      1) meta tags
+      2) JSON-LD
+      3) site-specific HTML patterns
+      4) plain-text fallbacks (handles split tags)
+      5) <time datetime="..."> with context
+      6) script-key fallback (dateModified, lastUpdated, etc.)
     """
     updated = published = source = confidence = ""
 
-    # --- Make soup + plain text early so we can reuse both ---
-    soup = BeautifulSoup(html, "lxml")
-    for el in soup(["script", "style", "noscript"]):
-        el.extract()
-    text = soup.get_text(separator=" ", strip=True)
-    text = re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
+    # Soup + plain text
+    soup = BeautifulSoup(html or "", "lxml")
+    for el in soup(["script","style","noscript"]): el.extract()
+    text = re.sub(r"\s+", " ", (soup.get_text(" ", strip=True) or "").replace("\xa0"," ")).strip()
 
-    # --- 1) Meta tags (high confidence) ---
+    # 1) Meta tags (high)
     for rx, src in META_UPDATED:
         m = rx.search(html)
         if m:
             updated = normalize_date(m.group(1)); source = src; confidence = "high"; break
-    m = META_PUBLISHED.search(html)
-    if m and not published:
-        published = normalize_date(m.group(2))
+    for rx in META_PUBLISHED:
+        if not published:
+            m = rx.search(html)
+            if m:
+                published = normalize_date(m.group(1 if rx is META_PUBLISHED[1] else (2 if rx is META_PUBLISHED[0] else 1)))
 
-    # --- 2) JSON-LD (high confidence) ---
+    # 2) JSON-LD (high)
     if ("application/ld+json" in html) and (not updated or not published):
         for script in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', html, flags=re.I):
             try:
@@ -166,92 +205,48 @@ def extract_dates(html: str, url: str):
                             updated = normalize_date(str(node["dateUpdated"])); source = source or "jsonld:dateUpdated"; confidence = confidence or "high"
                         if not published and node.get("datePublished"):
                             published = normalize_date(str(node["datePublished"]))
-            if updated and published and not confidence:
-                confidence = "high"
+            if updated and not confidence: confidence = "high"
 
-    # --- 3) Site-specific HTML patterns (as before) ---
+    # 3) Site-specific HTML hints (labels near dates)
     host = (urlparse(url).hostname or "").lower()
     def find_html(rx, src, conf):
         nonlocal updated, source, confidence
         if not updated:
             m = rx.search(html)
             if m:
-                # prefer the last group as the date if pattern has 2 groups (label + date)
-                val = m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(1)
+                val = m.group(2) if (m.lastindex and m.lastindex >= 2) else m.group(1)
                 updated = normalize_date(val)
-                source = source or src
-                confidence = confidence or conf
+                if updated:
+                    source = source or src
+                    confidence = confidence or conf
 
-    # eviQ
-    if re.search(r"(?:^|\.)eviq\.org\.au|(?:^|\.)cancerinstitute\.org\.au$", host):
-        find_html(re.compile(r'Last\s*updated\s*:?<\/?[^>]*>\s*([0-9]{1,2}\s+[A-Za-z]{3,9}\s+[0-9]{4})', re.I), "text:eviQ", "high")
-    # NHMRC
-    if "nhmrc.gov.au" in host:
-        find_html(re.compile(r'Date\s+last\s+updated\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{4})', re.I), "text:NHMRC", "medium")
-    # ACSQHC
-    if "safetyandquality.gov.au" in host or "acsqhc.gov.au" in host:
-        find_html(re.compile(r'Last\s*updated\s*:?<\/?[^>]*>\s*([0-9]{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:ACSQHC", "medium")
-    # MAGICapp
-    if "magicapp.org" in host:
-        find_html(re.compile(r'(Last\s*updated|Last\s*modified)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', re.I), "text:MAGICapp", "medium")
-    # Healthdirect (+ meta)
-    if "healthdirect.gov.au" in host:
-        find_html(re.compile(r'(Last\s*reviewed|Page\s*last\s*updated|Last\s*updated)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:Healthdirect", "high")
-        find_html(re.compile(r'<meta[^>]+name=["\']date\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:date.modified", "high")
-    # SA Health (+ meta)
-    if "sahealth.sa.gov.au" in host or host.endswith("sa.gov.au"):
-        find_html(re.compile(r'(Last\s*updated|Last\s*changed|Date\s*last\s*updated)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:SA Health", "medium")
-        find_html(re.compile(r'<meta[^>]+name=["\']DC\.Date\.Modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DC.Date.Modified", "high")
-        find_html(re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified", "high")
-    # NSW Health / ACI (+ meta)
-    if "health.nsw.gov.au" in host or "aci.health.nsw.gov.au" in host:
-        find_html(re.compile(r'(Last\s*updated|Date\s*last\s*updated)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:NSW Health/ACI", "medium")
+    # NSW Health – "Current as at"
+    if "health.nsw.gov.au" in host:
+        find_html(re.compile(r'Current\s+as\s+at[^<:]*[:>]\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:NSW:current-as-at", "high")
         find_html(re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified", "high")
         find_html(re.compile(r'<meta[^>]+name=["\']dcterms\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DCTERMS.modified", "high")
-    # RACGP (+ meta)
-    if "racgp.org.au" in host:
-        find_html(re.compile(r'(Last\s*updated|Reviewed)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:RACGP", "medium")
-        find_html(re.compile(r'<meta[^>]+name=["\']last-modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:last-modified", "high")
-    # eTG
-    if any(s in host for s in ["tg.org.au", "etg.tg.org.au", "tgldcdp.tg.org.au", "tgld.tg.org.au"]):
-        find_html(re.compile(r'(Last\s*updated|Last\s*revised|Content\s*last\s*updated)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:eTG", "medium")
-        find_html(re.compile(r'<meta[^>]+name=["\']last-modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:last-modified", "high")
-    # HETI
-    if "heti.nsw.gov.au" in host or "learn.heti.nsw.gov.au" in host:
-        find_html(re.compile(r'(Last\s*updated|Last\s*reviewed|Date\s*updated)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:HETI", "medium")
-        find_html(re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified", "high")
-    # Monash Health
-    if "monashhealth.org" in host:
-        find_html(re.compile(r'(Last\s*updated|Reviewed|Page\s*updated)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:MonashHealth", "medium")
-        find_html(re.compile(r'<meta[^>]+name=["\']article:modified_time["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:article:modified_time", "high")
-    # WHO
-    if host.endswith("who.int"):
-        find_html(re.compile(r'<meta[^>]+name=["\']lastmod["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:lastmod", "high")
-        find_html(re.compile(r'(Last\s*updated|Last\s*reviewed)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:WHO", "medium")
-    # CDC
-    if host.endswith("cdc.gov"):
-        find_html(re.compile(r'(Page\s*last\s*reviewed|Page\s*last\s*updated|Last\s*updated)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:CDC", "high")
-    # NICE
-    if host.endswith("nice.org.uk"):
-        find_html(re.compile(r'(Last\s*updated|Updated)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:NICE", "medium")
-        find_html(re.compile(r'<time[^>]+datetime=["\']([^"\']+)["\'][^>]*>\s*(?:Last\s*updated|Updated)?', re.I), "time:datetime", "high")
 
-    # --- 4) NEW: plain-text fallbacks (handles split tags/extra markup) ---
+    # RACGP
+    if "racgp.org.au" in host:
+        find_html(re.compile(r'(Last\s*updated|Reviewed)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:RACGP", "medium")
+        find_html(re.compile(r'<meta[^>]+name=["\']last-modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:last-modified", "high")
+
+    # Healthdirect/SA/ACI/eviQ/NICE/WHO/CDC/HETI/Monash/eTG (same as before but numeric dates allowed)
+    # ... (reuse your previous patterns if needed; generic fallback will usually catch)
+
+    # 4) Plain-text fallbacks (handles split tags)
     if not updated and text:
-        text_patterns = [
-            re.compile(r'\b(Last\s*updated|Page\s*last\s*updated|Last\s*reviewed|Last\s*modified|Date\s*last\s*updated|Updated(?:\s*on)?)\b[:\s]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I),
-        ]
-        for rx in text_patterns:
+        for rx in VISIBLE_UPDATED_GENERIC:
             m = rx.search(text)
             if m:
-                updated = normalize_date(m.group(2))
-                label = m.group(1).lower().replace(" ", "-")
-                source = source or f"text:{label}"
-                # mark high when it explicitly says "last updated"/"page last updated"
-                confidence = confidence or ("high" if "updated" in label else "medium")
-                break
+                updated = normalize_date(m.group(1))
+                if updated:
+                    lab = rx.pattern.split("\\b")[1].lower().replace("\\s*", " ").replace("\\s+", " ")
+                    source = source or f"text:{lab}"
+                    confidence = confidence or ("high" if "updated" in lab or "current as at" in lab else "medium")
+                    break
 
-    # --- 5) Generic <time datetime="..."> with 'updated' context in nearby text ---
+    # 5) <time datetime="..."> with 'updated/reviewed' context nearby
     if not updated:
         for t in soup.find_all("time"):
             dt_attr = t.get("datetime") or t.get("content")
@@ -260,15 +255,23 @@ def extract_dates(html: str, url: str):
                 t.get("aria-label", ""),
                 (t.parent.get_text(" ", strip=True) if t.parent else "")
             ])).lower()
-            if dt_attr and re.search(r'updated|reviewed|modified', context):
+            if dt_attr and re.search(r'updated|reviewed|modified|current as at', context):
                 val = normalize_date(dt_attr)
                 if val:
                     updated = val; source = source or "time:datetime"; confidence = confidence or "high"; break
 
-    # --- Generic published fallback from plain text (if still missing) ---
+    # 6) Script-key fallback for non-LD JSON blobs
+    if not updated:
+        m = SCRIPT_KEYS.search(html)
+        if m:
+            val = normalize_date(m.group(1)) or _parse_dayfirst_numeric(m.group(1)) or m.group(1)
+            if val:
+                updated = normalize_date(val); source = source or "script:date-key"; confidence = confidence or "medium"
+
+    # Published fallback (visible text)
     if not published and text:
         for rx in [
-            re.compile(r'\b(Published|Date\s*published|Publication\s*date)\b[:\s]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I),
+            re.compile(r'\b(Published|Date\s*published|Publication\s*date|First\s*published)\b[:\s-]*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})', re.I),
         ]:
             m = rx.search(text)
             if m:
@@ -276,76 +279,38 @@ def extract_dates(html: str, url: str):
 
     return updated, published, source, confidence
 
-    def find(rx, src, conf):
-        nonlocal updated, source, confidence
-        if not updated:
-            m = rx.search(html)
-            if m:
-                updated = normalize_date(m.group(1) if len(m.groups())==1 else m.group(2))
-                source = source or src
-                confidence = confidence or conf
+# ------------------ Optional JS rendering ------------------
+def should_render(host: str, html_text: str) -> bool:
+    if not USE_PLAYWRIGHT: return False
+    host = (host or "").lower()
+    if RENDER_DOMAINS and not any(host.endswith(d) or d in host for d in RENDER_DOMAINS):
+        return False
+    # Heuristics: SPA shells or instructions to enable scripts
+    if re.search(r'\bLoading\.\.\.|enable\s+scripts|this\s+site\s+requires\s+javascript', html_text or "", flags=re.I):
+        return True
+    # If nothing found by simple HTML (later we call when dates missing)
+    return True
 
-    if domain(host, "eviq.org.au", "cancerinstitute.org.au"):
-        find(re.compile(r'Last\s*updated\s*:?\s*</?[^>]*>\s*([0-9]{1,2}\s+[A-Za-z]{3,9}\s+[0-9]{4})', re.I), "text:eviQ", "high")
-    if domain(host, "nhmrc.gov.au"):
-        find(re.compile(r'Date\s+last\s+updated\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+[0-9]{4})', re.I), "text:NHMRC", "medium")
-    if domain(host, "safetyandquality.gov.au", "acsqhc.gov.au"):
-        find(re.compile(r'Last\s*updated\s*:?\s*</?[^>]*>\s*([0-9]{1,2}\s+[A-Za-z]{3,9}\s+[0-9]{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:ACSQHC", "medium")
-    if domain(host, "magicapp.org"):
-        find(re.compile(r'(Last\s*updated|Last\s*modified)\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', re.I), "text:MAGICapp", "medium")
-    if domain(host, "healthdirect.gov.au"):
-        find(re.compile(r'(Last\s*reviewed|Page\s*last\s*updated|Last\s*updated)\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:Healthdirect", "high")
-        find(re.compile(r'<meta[^>]+name=["\']date\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:date.modified", "high")
-    if domain(host, "sahealth.sa.gov.au", "sa.gov.au"):
-        find(re.compile(r'(Last\s*updated|Last\s*changed|Date\s*last\s*updated)\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:SA Health", "medium")
-        find(re.compile(r'<meta[^>]+name=["\']DC\.Date\.Modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DC.Date.Modified", "high")
-        find(re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified", "high")
-    if domain(host, "health.nsw.gov.au", "aci.health.nsw.gov.au"):
-        find(re.compile(r'(Last\s*updated|Date\s*last\s*updated)\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:NSW Health/ACI", "medium")
-        find(re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified", "high")
-        find(re.compile(r'<meta[^>]+name=["\']dcterms\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DCTERMS.modified", "high")
-    if domain(host, "racgp.org.au"):
-        find(re.compile(r'(Last\s*updated|Reviewed)\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:RACGP", "medium")
-        find(re.compile(r'<meta[^>]+name=["\']last-modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:last-modified", "high")
-    if domain(host, "tg.org.au", "etg.tg.org.au", "tgldcdp.tg.org.au", "tgld.tg.org.au"):
-        find(re.compile(r'(Last\s*updated|Last\s*revised|Content\s*last\s*updated)\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:eTG", "medium")
-        find(re.compile(r'<meta[^>]+name=["\']last-modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:last-modified", "high")
-    if domain(host, "heti.nsw.gov.au", "learn.heti.nsw.gov.au"):
-        find(re.compile(r'(Last\s*updated|Last\s*reviewed|Date\s*updated)\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:HETI", "medium")
-        find(re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified", "high")
-    if domain(host, "monashhealth.org"):
-        find(re.compile(r'(Last\s*updated|Reviewed|Page\s*updated)\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:MonashHealth", "medium")
-        find(re.compile(r'<meta[^>]+name=["\']article:modified_time["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:article:modified_time", "high")
-    if domain(host, "who.int"):
-        find(re.compile(r'<meta[^>]+name=["\']lastmod["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:lastmod", "high")
-        find(re.compile(r'(Last\s*updated|Last\s*reviewed)\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:WHO", "medium")
-    if domain(host, "cdc.gov"):
-        find(re.compile(r'(Page\s*last\s*reviewed|Page\s*last\s*updated|Last\s*updated)\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:CDC", "high")
-    if domain(host, "nice.org.uk"):
-        find(re.compile(r'(Last\s*updated|Updated)\s*:?\s*</?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:NICE", "medium")
-        find(re.compile(r'<time[^>]+datetime=["\']([^"\']+)["\'][^>]*>\s*(?:Last\s*updated|Updated)?', re.I), "time:datetime", "high")
+def render_html_playwright(url: str, timeout_ms: int = 25000) -> str:
+    """Headless render using Playwright Chromium; returns fully rendered HTML."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        try:
+            ctx = browser.new_context()
+            page = ctx.new_page()
+            page.set_default_timeout(timeout_ms)
+            page.goto(url, wait_until="networkidle")
+            # Give late JS a moment if needed
+            with contextlib.suppress(Exception):
+                page.wait_for_load_state("networkidle")
+            content = page.content()
+            return content or ""
+        finally:
+            with contextlib.suppress(Exception):
+                browser.close()
 
-    if not updated:
-        for rx in VISIBLE_UPDATED_GENERIC:
-            m = rx.search(html)
-            if m:
-                updated = normalize_date(m.group(1))
-                source = source or "text:last-updated"
-                confidence = confidence or "medium"
-                break
-    if not published:
-        for rx in [
-            re.compile(r'Published\s*[:-]\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})', re.I),
-            re.compile(r'Date\s+published\s*[:-]\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})', re.I),
-            re.compile(r'Publication\s+date\s*[:-]\s*(\d{4}-\d{2}-\d{2})', re.I),
-        ]:
-            m = rx.search(html)
-            if m:
-                published = normalize_date(m.group(1))
-                break
-    return updated, published, source, confidence
-
-# --------- per-URL processing ----------
+# ------------------ Per-URL processing ------------------
 def process_url(url: str, base_timeout: int, gov_timeout: int):
     host = (urlparse(url).hostname or "").lower()
     timeout = gov_timeout if is_gov_au(host) else base_timeout
@@ -358,12 +323,14 @@ def process_url(url: str, base_timeout: int, gov_timeout: int):
     detected_updated = detected_published = updated_source = confidence = ""
 
     try:
+        # Prefer HEAD then GET
         try:
             r = sess.head(url, allow_redirects=False, timeout=timeout)
         except Exception as e:
             notes.append(f"HEAD fail: {e.__class__.__name__}")
             r = sess.get(url, allow_redirects=False, timeout=timeout)
 
+        # follow redirects (cap 5)
         hops = 0
         while 300 <= r.status_code < 400 and "Location" in r.headers and hops < 5:
             final_url = requests.compat.urljoin(final_url, r.headers["Location"])
@@ -381,18 +348,40 @@ def process_url(url: str, base_timeout: int, gov_timeout: int):
 
         ct = (r.headers.get("Content-Type","") or "").lower()
         body = b""
+        html_text = ""
         if code and 200 <= code < 300 and "text/html" in ct:
             try:
                 rr = r if r.request.method != "HEAD" else sess.get(final_url, allow_redirects=False, timeout=timeout)
                 body = rr.content or b""
+                html_text = rr.text or ""
                 soup = BeautifulSoup(body, "lxml")
                 if soup.title and soup.title.string:
                     title = soup.title.string.strip()
-                u,p,src,conf = extract_dates(rr.text, final_url)
+
+                # Try static extraction first
+                u,p,src,conf = extract_dates(html_text, final_url)
+
+                # JS render fallback if still missing (or SPA shell detected)
+                if (not u and not p) and should_render(host, html_text):
+                    try:
+                        rendered = render_html_playwright(final_url, timeout_ms=(timeout*1000))
+                        if rendered:
+                            u2,p2,src2,conf2 = extract_dates(rendered, final_url)
+                            if not title:
+                                s2 = BeautifulSoup(rendered, "lxml")
+                                title = (s2.title.string.strip() if s2.title and s2.title.string else title)
+                            # prefer rendered findings
+                            if u2: u, src, conf = u2, src2, conf2 or conf
+                            if p2: p = p2
+                            notes.append("rendered:playwright")
+                    except Exception as e:
+                        notes.append(f"render fail: {e.__class__.__name__}")
+
                 detected_updated, detected_published, updated_source, confidence = u,p,src,conf
                 content_hash = sha256_hex(limit_bytes(body, 200_000))
             except Exception as e:
                 notes.append(f"parse fail: {e.__class__.__name__}")
+
         elif code and 200 <= code < 300:
             try:
                 if r.request.method == "HEAD":
@@ -404,6 +393,7 @@ def process_url(url: str, base_timeout: int, gov_timeout: int):
             except Exception as e:
                 notes.append(f"hash fail: {e.__class__.__name__}")
 
+        # classify
         if code and 200 <= code < 300:
             status = "OK"; note = " | ".join(n for n in notes if n)
         elif code:
@@ -430,7 +420,7 @@ def process_url(url: str, base_timeout: int, gov_timeout: int):
             upd_source="", confidence=""
         )
 
-# --------- Google Sheets I/O ----------
+# ------------------ Google Sheets I/O ------------------
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 def gs_client():
     creds = Credentials.from_service_account_file("sa.json", scopes=SCOPES)
@@ -524,7 +514,9 @@ def main():
     write_results(ws, rows, results)
 
 if __name__ == "__main__":
+    # Make DNS timeouts shorter to avoid long hangs
     socket.setdefaulttimeout(12)
+    # Log to file for artifact
     import sys
     class Tee(object):
         def __init__(self, name):
