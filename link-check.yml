@@ -1,0 +1,46 @@
+name: Link checker (Google Sheet)
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Runs daily at 03:00 Australia/Melbourne (AEDT ≈ UTC+11 / AEST ≈ UTC+10).
+    # 16:00 UTC generally lines up with 03:00 AEDT (adjust if daylight saving changes).
+    - cron: "0 16 * * *"
+
+concurrency:
+  group: link-check
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Write service account JSON
+        run: |
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > sa.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      - name: Run checker
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SHEET_NAME: Sheet1
+          MAX_WORKERS: "6"
+          GOV_TIMEOUT: "30"
+          BASE_TIMEOUT: "15"
+        run: |
+          python checker.py --sheet "$SHEET_ID" --tab "$SHEET_NAME"             --workers "$MAX_WORKERS" --gov-timeout "$GOV_TIMEOUT" --base-timeout "$BASE_TIMEOUT"
+      - name: Upload run log (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: link-check-log
+          path: run.log
