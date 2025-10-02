@@ -45,6 +45,27 @@ jobs:
         run: |
           python checker.py --sheet "$SHEET_ID" --tab "$SHEET_NAME" \
             --workers "$MAX_WORKERS" --gov-timeout "$GOV_TIMEOUT" --base-timeout "$BASE_TIMEOUT"
+      - name: Post Topic Area summary to Slack (only when there are new changes)
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python - <<'PY'
+          import json, os, sys, urllib.request
+          # Read summary built by checker.py
+          with open('topic_summary.json','r',encoding='utf-8') as f:
+              data = json.load(f)
+          if data.get('total_changes', 0) == 0:
+              print("No new changes; skipping Slack.")
+              sys.exit(0)
+          with open('topic_summary.md','r',encoding='utf-8') as f:
+              text = f.read().strip()
+          payload = {"text": text}
+          req = urllib.request.Request(os.environ['SLACK_WEBHOOK_URL'],
+              data=json.dumps(payload).encode('utf-8'),
+              headers={'Content-Type':'application/json'})
+          print(urllib.request.urlopen(req).read().decode())
+          PY
       - name: Upload run log (optional)
         if: always()
         uses: actions/upload-artifact@v4
