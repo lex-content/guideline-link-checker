@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
-# for summaries
+# for summaries / Slack text
 from zoneinfo import ZoneInfo
 from collections import OrderedDict
 
@@ -579,7 +579,10 @@ def _write_summary_files(rows, results):
     with open("summary.md", "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-# ------------------ NEW: Topic Area (Column R) Summary (pretty Slack formatting) ------------------
+# ------------------ NEW: Topic Area (Column R) Summary — pretty Slack formatting ------------------
+def _sanitize_title_for_slack(t: str) -> str:
+    return (t or "").replace("|", "∣").strip()
+
 def _write_topic_area_summary(rows, results, tz_str="Australia/Melbourne"):
     """
     Builds a Slack-ready message grouped by Column R ("Topic Area"),
@@ -589,8 +592,6 @@ def _write_topic_area_summary(rows, results, tz_str="Australia/Melbourne"):
 
     Topic Area: *Addiction (❗️6 changes detected)*
     • <URL|Title>, modified: Thu, 02 Oct 2025 00:42:21 GMT, changed
-    • <URL|Title>, changed, source updated: text:last-updated
-    ...
     """
     tz = ZoneInfo(tz_str)
     now_local = datetime.now(tz)
@@ -704,7 +705,10 @@ def main():
                     det_updated="", det_published="", upd_source="", confidence=""
                 )
                 continue
-            futs[ex.submit(process_url, url, base_timeout, gov_timeout)] = idx
+        # submit after skipping blanks
+        for idx, url in enumerate(urls):
+            if results[idx] is None:
+                futs[ex.submit(process_url, url, base_timeout, gov_timeout)] = idx
 
         for fut in as_completed(futs):
             idx = futs[fut]
