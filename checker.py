@@ -11,6 +11,10 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
+# for summaries
+from zoneinfo import ZoneInfo
+from collections import OrderedDict
+
 # ------------------ Config via CLI/env ------------------
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -87,7 +91,7 @@ def _parse_dayfirst_numeric(s: str) -> str:
                 return ""
     return ""
 
-# ---------- CHANGE #1: Smarter normalize_date (strips weekday prefixes) ----------
+# ---------- Smarter normalize_date (strips weekday prefixes) ----------
 def normalize_date(s: str) -> str:
     """Convert many date spellings into ISO (UTC) for comparison."""
     if not s:
@@ -151,14 +155,14 @@ META_UPDATED = [
     (re.compile(r'<meta[^>]+name=["\']dcterms\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DCTERMS.modified"),
     (re.compile(r'<meta[^>]+name=["\']DC\.Date\.Modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DC.Date.Modified"),
 ]
-# Make published meta patterns consistent with group index
+# Published meta patterns with explicit group index
 META_PUBLISHED = [
     (re.compile(r'<meta[^>]+(itemprop|name|property)=["\']datePublished["\'][^>]+content=["\']([^"\']+)["\']', re.I), 2),
     (re.compile(r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']', re.I), 1),
     (re.compile(r'<meta[^>]+name=["\']dc\.date["\'][^>]+content=["\']([^"\']+)["\']', re.I), 1),
 ]
 
-# ---------- CHANGE #3: Generic visible-text patterns with optional weekday ----------
+# Generic visible-text patterns with optional weekday
 WEEKDAY_OPT = r'(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\s+'
 DATE_CORE   = r'(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})'
 
@@ -241,7 +245,7 @@ def extract_dates(html: str, url: str):
                     source = source or src
                     confidence = confidence or conf
 
-    # ---------- CHANGE #2: NSW Health – "Current as at" with optional weekday ----------
+    # NSW Health – "Current as at" with optional weekday
     if "health.nsw.gov.au" in host:
         weekday_opt = r'(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\s+'
         date_core = DATE_CORE
@@ -251,7 +255,7 @@ def extract_dates(html: str, url: str):
         find_html(re.compile(r'<meta[^>]+name=["\']modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:modified", "high")
         find_html(re.compile(r'<meta[^>]+name=["\']dcterms\.modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:DCTERMS.modified", "high")
 
-    # Some other commonly handled sites (kept brief; generic fallback covers many):
+    # RACGP (example)
     if "racgp.org.au" in host:
         find_html(re.compile(r'(Last\s*updated|Reviewed)\s*:?<\/?[^>]*>\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})', re.I), "text:RACGP", "medium")
         find_html(re.compile(r'<meta[^>]+name=["\']last-modified["\'][^>]+content=["\']([^"\']+)["\']', re.I), "meta:last-modified", "high")
@@ -263,11 +267,8 @@ def extract_dates(html: str, url: str):
             if m:
                 updated = normalize_date(m.group(1))
                 if updated:
-                    # derive a human source label from the regex pattern's first keyword
-                    label_match = re.search(r'\\b([A-Za-z ]+?)\\b', rx.pattern)
-                    label = (label_match.group(1) if label_match else "text:last-updated").lower().strip()
-                    source = source or f"text:{label}"
-                    confidence = confidence or ("high" if "updated" in label or "current as at" in label else "medium")
+                    source = source or "text:last-updated"
+                    confidence = confidence or "medium"
                     break
 
     # 5) <time datetime="..."> with 'updated/reviewed' context nearby
@@ -325,7 +326,6 @@ def render_html_playwright(url: str, timeout_ms: int = 25000) -> str:
             page = ctx.new_page()
             page.set_default_timeout(timeout_ms)
             page.goto(url, wait_until="networkidle")
-            # Give late JS a moment if needed
             with contextlib.suppress(Exception):
                 page.wait_for_load_state("networkidle")
             content = page.content()
@@ -394,7 +394,6 @@ def process_url(url: str, base_timeout: int, gov_timeout: int):
                             if not title:
                                 s2 = BeautifulSoup(rendered, "lxml")
                                 title = (s2.title.string.strip() if s2.title and s2.title.string else title)
-                            # prefer rendered findings
                             if u2: u, src, conf = u2, src2, conf2 or conf
                             if p2: p = p2
                             notes.append("rendered:playwright")
@@ -479,28 +478,206 @@ def write_results(ws, rows, results):
         last_changed = now if changed else (prev_last_changed or "")
 
         out = [
-            res["status"],
-            res["code"],
-            res["final_url"],
-            res["title"],
-            now,
-            res["notes"],
-            res["etag"],
-            res["lastmod"],
-            res["content_hash"],
-            "UPDATED" if changed else "",
-            first_seen,
-            last_changed,
-            res["det_updated"],
-            res["upd_source"],
-            res["det_published"],
-            res["confidence"],
+            res["status"],           # B
+            res["code"],             # C
+            res["final_url"],        # D
+            res["title"],            # E
+            now,                     # F Last Checked
+            res["notes"],            # G
+            res["etag"],             # H
+            res["lastmod"],          # I
+            res["content_hash"],     # J
+            "UPDATED" if changed else "",  # K Change?
+            first_seen,              # L First Seen
+            last_changed,            # M Last Changed
+            res["det_updated"],      # N Detected Updated
+            res["upd_source"],       # O Updated Source
+            res["det_published"],    # P Detected Published
+            res["confidence"],       # Q Parse Confidence
         ]
         updates.append(out)
 
     end_row = 1 + len(results)
     ws.update(f"B2:Q{end_row}", updates, value_input_option="RAW")
 
+# ------------------ (Existing) Simple Summary (kept for compatibility) ------------------
+def _generate_summary(rows, results, tz_str="Australia/Melbourne"):
+    tz = ZoneInfo(tz_str)
+    now_local = datetime.now(tz)
+    date_label = now_local.strftime("%A %d %B %Y")
+
+    items_updated, items_broken, items_error = [], [], []
+    for row, res in zip(rows, results):
+        row = (row + [""] * (17 - len(row)))[:17]
+        url = row[0].strip()
+        title = res.get("title") or row[4] or url
+        final_url = res.get("final_url") or url
+        det_upd = res.get("det_updated") or ""
+        upd_src = res.get("upd_source") or ""
+        status  = (res.get("status") or "").upper()
+
+        if status == "BROKEN":
+            items_broken.append({"title": title, "url": final_url, "code": res.get("code"), "notes": res.get("notes")})
+        elif status == "ERROR":
+            items_error.append({"title": title, "url": final_url, "notes": res.get("notes")})
+        else:
+            prev_etag = row[7] or ""
+            prev_lastmod = row[8] or ""
+            prev_hash = row[9] or ""
+            changed = (
+                (res.get("etag") and res["etag"] != prev_etag) or
+                (res.get("lastmod") and res["lastmod"] != prev_lastmod) or
+                (res.get("content_hash") and res["content_hash"] != prev_hash)
+            )
+            if changed:
+                items_updated.append({
+                    "title": title, "url": final_url,
+                    "det_updated": det_upd, "upd_source": upd_src,
+                })
+
+    summary = {
+        "date_local": date_label,
+        "counts": {
+            "checked": len(results),
+            "updated": len(items_updated),
+            "broken": len(items_broken),
+            "errors": len(items_error),
+        },
+        "updated": items_updated,
+        "broken": items_broken,
+        "errors": items_error,
+    }
+    return summary
+
+def _write_summary_files(rows, results):
+    summary = _generate_summary(rows, results)
+    with open("summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    lines = [f"*Daily guideline link check — {summary['date_local']}*", "",
+             f"*Totals:* {summary['counts']['checked']} checked · {summary['counts']['updated']} updated · {summary['counts']['broken']} broken · {summary['counts']['errors']} errors", ""]
+    if summary["updated"]:
+        lines.append("*Updated*")
+        for it in summary["updated"][:10]:
+            extra = ""
+            if it.get('det_updated') or it.get('upd_source'):
+                extra = f" · _{it.get('det_updated','')}_"
+                if it.get('upd_source'): extra += f" via `{it['upd_source']}`"
+            lines.append(f"• <{it['url']}|{it['title']}>{extra}")
+        lines.append("")
+    if summary["broken"]:
+        lines.append("*Broken*")
+        for it in summary["broken"][:10]:
+            code = f" [{it.get('code')}]" if it.get("code") else ""
+            lines.append(f"• <{it['url']}|{it['title']}>{code}")
+        lines.append("")
+    if summary["errors"]:
+        lines.append("*Errors*")
+        for it in summary["errors"][:10]:
+            lines.append(f"• <{it['url']}|{it['title']}>")
+        lines.append("")
+    with open("summary.md", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+# ------------------ NEW: Topic Area (Column R) Summary ------------------
+def _sanitize_title_for_slack(t: str) -> str:
+    return (t or "").replace("|", "∣").strip()
+
+def _write_topic_area_summary(rows, results, tz_str="Australia/Melbourne"):
+    """
+    Build a Slack-ready summary grouped by Column R ("Topic Area").
+    Only include rows where a NEW change happened this run.
+    Per item, list labels that changed this run:
+      - 'modified'        (Column I / Last-Modified)
+      - 'changed'         (content hash changed this run)
+      - 'updated'         (Column N / Detected Updated)
+      - 'source updated'  (Column O / Updated Source)
+      - 'published'       (Column P / Detected Published)
+    """
+    tz = ZoneInfo(tz_str)
+    now_local = datetime.now(tz)
+    date_label = now_local.strftime("%A %d %B %Y")
+
+    groups = OrderedDict()   # {topic_area: [ {title,url,tags[]} ]}
+    total_changes = 0
+
+    for row, res in zip(rows, results):
+        # Ensure columns up to R exist (A=0 .. R=17)
+        row = (row + [""] * (18 - len(row)))[:18]
+        url_colA = (row[0] or "").strip()
+        if not url_colA:
+            continue
+
+        # Previous saved values (from sheet)
+        prev_etag        = row[7]  or ""   # H
+        prev_lastmod     = row[8]  or ""   # I
+        prev_hash        = row[9]  or ""   # J
+        prev_det_updated = row[13] or ""   # N
+        prev_upd_source  = row[14] or ""   # O
+        prev_published   = row[15] or ""   # P
+        topic_area       = (row[17] or "").strip() or "Uncategorised"  # R
+
+        # New values from this run
+        lastmod     = res.get("lastmod")        or ""
+        contenthash = res.get("content_hash")   or ""
+        det_updated = res.get("det_updated")    or ""
+        upd_source  = res.get("upd_source")     or ""
+        det_pub     = res.get("det_published")  or ""
+
+        # Detect NEW changes relative to previous sheet values
+        changed_modified   = bool(lastmod)     and (lastmod     != prev_lastmod)
+        changed_hash       = bool(contenthash) and (contenthash != prev_hash)      # 'changed'
+        changed_updated    = bool(det_updated) and (det_updated != prev_det_updated)
+        changed_upd_source = bool(upd_source)  and (upd_source  != prev_upd_source)
+        changed_published  = bool(det_pub)     and (det_pub     != prev_published)
+
+        if not (changed_modified or changed_hash or changed_updated or changed_upd_source or changed_published):
+            continue  # skip rows with no new change this run
+
+        # Compose labels (only those that changed this run)
+        tags = []
+        if changed_modified:   tags.append(f"modified: {lastmod}")
+        if changed_hash:       tags.append("changed")
+        if changed_updated:    tags.append(f"updated: {det_updated}")
+        if changed_upd_source: tags.append(f"source updated: {upd_source}")
+        if changed_published:  tags.append(f"published: {det_pub}")
+
+        # Title: Column E preferred, else detected title, else URL
+        title_colE = (row[4] or "").strip()
+        title = _sanitize_title_for_slack(title_colE or res.get("title") or url_colA)
+
+        groups.setdefault(topic_area, []).append({
+            "title": title,
+            "url": url_colA,        # Use Column A URL for the hyperlink
+            "tags": tags,
+        })
+        total_changes += 1
+
+    # Build Slack text in your phrasing
+    lines = []
+    if total_changes:
+        lines.append("Here's the daily update on any new key resource changes:")
+        for topic, items in groups.items():
+            if not items:
+                continue
+            lines.append(f"Topic Area: {topic} ({len(items)} changes detected)")
+            for it in items:
+                link = f"<{it['url']}|{it['title']}>"
+                suffix = f", {', '.join(it['tags'])}" if it["tags"] else ""
+                lines.append(f"- {link}{suffix}")
+            lines.append("")  # spacer between groups
+
+    summary = {
+        "date_local": date_label,
+        "total_changes": total_changes,
+        "groups": groups,
+    }
+    with open("topic_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    with open("topic_summary.md", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) if lines else "")
+
+# ------------------ Main ------------------
 def main():
     args = parse_args()
     ws, all_values = read_rows(args.sheet, args.tab)
@@ -535,6 +712,11 @@ def main():
                     det_updated="", det_published="", upd_source="", confidence=""
                 )
 
+    # Create summaries BEFORE writing (so "new change" compares against previous sheet values)
+    _write_summary_files(rows, results)          # optional simple summary (kept for compatibility)
+    _write_topic_area_summary(rows, results)     # your custom Topic Area digest
+
+    # Persist results back to the sheet
     write_results(ws, rows, results)
 
 if __name__ == "__main__":
