@@ -579,20 +579,18 @@ def _write_summary_files(rows, results):
     with open("summary.md", "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-# ------------------ NEW: Topic Area (Column R) Summary ------------------
-def _sanitize_title_for_slack(t: str) -> str:
-    return (t or "").replace("|", "∣").strip()
-
+# ------------------ NEW: Topic Area (Column R) Summary (pretty Slack formatting) ------------------
 def _write_topic_area_summary(rows, results, tz_str="Australia/Melbourne"):
     """
-    Build a Slack-ready summary grouped by Column R ("Topic Area").
-    Only include rows where a NEW change happened this run.
-    Per item, list labels that changed this run:
-      - 'modified'        (Column I / Last-Modified)
-      - 'changed'         (content hash changed this run)
-      - 'updated'         (Column N / Detected Updated)
-      - 'source updated'  (Column O / Updated Source)
-      - 'published'       (Column P / Detected Published)
+    Builds a Slack-ready message grouped by Column R ("Topic Area"),
+    ONLY for rows that had a NEW change this run, with formatting like:
+
+    Here's the daily update on any new key resource changes:
+
+    Topic Area: *Addiction (❗️6 changes detected)*
+    • <URL|Title>, modified: Thu, 02 Oct 2025 00:42:21 GMT, changed
+    • <URL|Title>, changed, source updated: text:last-updated
+    ...
     """
     tz = ZoneInfo(tz_str)
     now_local = datetime.now(tz)
@@ -634,7 +632,7 @@ def _write_topic_area_summary(rows, results, tz_str="Australia/Melbourne"):
         if not (changed_modified or changed_hash or changed_updated or changed_upd_source or changed_published):
             continue  # skip rows with no new change this run
 
-        # Compose labels (only those that changed this run)
+        # Compose labels (only those that changed this run), in your phrasing/order
         tags = []
         if changed_modified:   tags.append(f"modified: {lastmod}")
         if changed_hash:       tags.append("changed")
@@ -642,7 +640,7 @@ def _write_topic_area_summary(rows, results, tz_str="Australia/Melbourne"):
         if changed_upd_source: tags.append(f"source updated: {upd_source}")
         if changed_published:  tags.append(f"published: {det_pub}")
 
-        # Title: Column E preferred, else detected title, else URL
+        # Title: Column E preferred, else detected title, else URL (and sanitise pipes for Slack)
         title_colE = (row[4] or "").strip()
         title = _sanitize_title_for_slack(title_colE or res.get("title") or url_colA)
 
@@ -653,18 +651,25 @@ def _write_topic_area_summary(rows, results, tz_str="Australia/Melbourne"):
         })
         total_changes += 1
 
-    # Build Slack text in your phrasing
+    # Build Slack text in your exact style
     lines = []
     if total_changes:
         lines.append("Here's the daily update on any new key resource changes:")
+        lines.append("")  # blank line after intro
+
         for topic, items in groups.items():
             if not items:
                 continue
-            lines.append(f"Topic Area: {topic} ({len(items)} changes detected)")
+            n = len(items)
+            change_word = "change" if n == 1 else "changes"
+            # Bold topic header with ❗️ and count
+            lines.append(f"Topic Area: *{topic} (❗️{n} {change_word} detected)*")
+
+            # Bulleted items with clickable titles
             for it in items:
                 link = f"<{it['url']}|{it['title']}>"
                 suffix = f", {', '.join(it['tags'])}" if it["tags"] else ""
-                lines.append(f"- {link}{suffix}")
+                lines.append(f"• {link}{suffix}")
             lines.append("")  # spacer between groups
 
     summary = {
@@ -674,6 +679,7 @@ def _write_topic_area_summary(rows, results, tz_str="Australia/Melbourne"):
     }
     with open("topic_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+    # Write the final Slack text
     with open("topic_summary.md", "w", encoding="utf-8") as f:
         f.write("\n".join(lines) if lines else "")
 
