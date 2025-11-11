@@ -10,6 +10,8 @@ concurrency:
   group: link-check
   cancel-in-progress: false
 
+# … top of file and env block same as above …
+
 jobs:
   run-checker:
     runs-on: ubuntu-latest
@@ -58,7 +60,7 @@ jobs:
 
       - name: Post Topic Area summary to Slack (only when there are new changes)
         if: always()
-        working-directory: link-checker      # <— match the same folder
+        working-directory: workflows      # <— match the same folder
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
