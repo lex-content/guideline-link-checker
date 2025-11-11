@@ -11,64 +11,75 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  run:
+  run-checker:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: link-checker   # <— set to the folder that contains checker.py
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install deps
+
+      - name: Install Python deps
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install -U pip
           pip install -r requirements.txt
+
       - name: Install Playwright browser (for JS-rendered pages)
+        if: env.USE_SHIP == '0' || env.USE_PLAYWRIGHT == '1'
         run: |
           python -m playwright install --with-deps chromium
+
       - name: Write service account JSON
         run: |
-          echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > sa.json
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > sa.json
+
       - name: Run checker
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          SHEET_NAME: Sheet1
-          # Rendering toggles
-          USE_PLAYWRIGHT: "1"
-          RENDER_DOMAINS: "health.gov.au,health.nsw.gov.au,racgp.org.au,comorbidityguidelines.org.au,alcoholtreatmentguidelines.com.au"
-          # Networking
-          MAX_WORKERS: "4"          # when rendering is on, keep this modest
-          GOV_TIMEOUT: "40"         # per-request seconds (*.gov.au)
-          BASE_TIMEOUT: "20"        # per-request seconds (others)
         run: |
-          python checker.py --sheet "$SHEET_ID" --tab "$SHEET_NAME" \
-            --workers "$MAX_WORKERS" --gov-timeout "$GOV_TIMEOUT" --base-timeout "$BASE_TIMEOUT"
-      - name: Post Topic Area summary to Slack (only when there are new changes)
-        if: always()
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          python - <<'PY'
-          import json, os, sys, urllib.request
-          # Read summary built by checker.py
-          with open('topic_summary.json','r',encoding='utf-8') as f:
-              data = json.load(f)
-          if data.get('total_changes', 0) == 0:
-              print("No new changes; skipping Slack.")
-              sys.exit(0)
-          with open('topic_summary.md','r',encoding='utf-8') as f:
-              text = f.read().strip()
-          payload = {"text": text}
-          req = urllib.request.Request(os.environ['SLACK_WEBHOOK_URL'],
-              data=json.dumps(payload).encode('utf-8'),
-              headers={'Content-Type':'application/json'})
-          print(urllib.request.urlopen(req).read().decode())
-          PY
-      - name: Upload run log (optional)
+            python -u checker.py --sheet "${{ env.SHEET_ID }}" --tab "${{ env.SHEET_NAME }}"
+
+      - name: Upload run log & summaries
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: link-check-log
-          path: run.log
+          name: link-checker-artifacts
+          path: |
+            link-checker/run.log
+            link-checker/summary.md
+            link-checker/summary.json
+            link-checker/topic_summary.md
+            link-checker/topic_summary.json
+          if-no-files-found: ignore
+
+      - name: Post Topic Area summary to Slack (only when there are new changes)
+        if: always()
+        working-directory: link-checker      # <— match the same folder
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -e
+          JSON_PATH="topic_summary.json"
+          MD_PATH="topic_summary.md"
+          if [ ! -f "$JSON_PATH" ] || [ ! f "$MD_PATH" ]; then
+            echo "No topic_summary files found (checker may have failed or wrote to a different folder). Skipping Slack."
+            exit 0
+          fi
+          python - <<'PY'
+          import json, os, sys, urllib.request
+          with open("topic_summary.json",'r',encoding='utf-8') as f:
+              data=json.load(f)
+          if data.get('total_changes',0)==0:
+              print("No new changes; skipping Slack.")
+              sys.exit(0)
+          with open("topic_summary.md",'r',encoding='utf-8') as f:
+              text=f.read().strip()
+          req=urllib.request.Request(os.environ['SLACK_WEBHOOK_URL'],
+                                     data=json.dumps({"text": text}).encode('utf-8'),
+                                     headers={'Content-Type':'application/json'})
+          print(urllib.request.urlopen(req).read().decode())
+          PY
