@@ -35,9 +35,9 @@ USE_PLAYWRIGHT = os.getenv("USE_PLAYWRIGHT", "0") == "1"
 RENDER_DOMAINS = {d.strip().lower() for d in os.getenv("RENDER_DOMAINS", "").split(",") if d.strip()}
 
 # Alert strategies for Slack topic digest:
-# - "both" (default): require text change AND date marker == today (local)
-# - "today_only": require date marker == today (local)
-# - "text_change": require text change (ignores dates)
+# - "both" (default): require text change AND/OR allow date-today items (with this build, K updates always alert)
+# - "today_only": date marker == today (local)
+# - "text_change": text change only (ignores dates)
 ALERT_MODE = os.getenv("ALERT_MODE", "both").lower()
 ALERT_TZ = os.getenv("ALERT_TZ", "Australia/Melbourne")
 
@@ -64,7 +64,7 @@ def make_session(timeout_s: int):
         "Accept-Language": "en-AU,en;q=0.8",
         "Cache-Control": "no-cache",
     })
-    sess.request_timeout = timeout_s  # note: we still pass per-request timeouts
+    sess.request_timeout = timeout_s
     return sess
 
 # ===================== Date & Text Helpers =====================
@@ -93,25 +93,21 @@ def normalize_date(s: str) -> str:
     if not s:
         return ""
     s = s.strip()
-    # Drop leading weekday like "Thursday," or "Thu "
     s = re.sub(
         r"^(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?),?\s+",
         "",
         s, flags=re.I
     )
-    # ISO-ish
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
     except Exception:
         pass
-    # Common formats
     for fmt in ("%Y-%m-%d", "%d %B %Y", "%d %b %Y", "%b %d, %Y", "%B %d, %Y", "%Y/%m/%d"):
         try:
             dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
             return dt.isoformat()
         except Exception:
             pass
-    # Month Year -> assume day 1
     m = re.search(r"([A-Za-z]{3,9})\s+(\d{4})", s)
     if m:
         mon = m.group(1).lower()
@@ -120,12 +116,10 @@ def normalize_date(s: str) -> str:
         if mon in MONTHS:
             dt = datetime(int(m.group(2)), MONTHS[mon] + 1, 1, tzinfo=timezone.utc)
             return dt.isoformat()
-    # yyyy-mm-dd anywhere
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=timezone.utc)
         return dt.isoformat()
-    # dd/mm/yyyy or dd.mm.yyyy or dd-mm-yyyy
     for rx in (r"(\d{1,2})/(\d{1,2})/(\d{4})", r"(\d{1,2})\.(\d{1,2})\.(\d{4})", r"(\d{1,2})-(\d{1,2})-(\d{4})"):
         m = re.search(rx, s)
         if m:
@@ -136,7 +130,6 @@ def normalize_date(s: str) -> str:
                 pass
     return ""
 
-# Remove volatile date/timestamp tokens from visible text
 DATE_WORDS   = r"(?:Last\s*updated|Page\s*last\s*updated|Last\s*reviewed|Reviewed|Updated(?:\s*on)?|Current\s+as\s+at|Last\s*(?:changed|revised|modified))"
 DATE_TOKEN   = r"(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|(?:\d{1,2}[/\.-]){2}\d{4}|\d{4}-\d{2}-\d{2})(?:\s+\d{2}:\d{2}(?::\d{2})?(?:\s*(?:AM|PM))?)?"
 TIMESTAMP_NOISE = re.compile(rf"{DATE_WORDS}\s*[:\-–—]?\s*{DATE_TOKEN}|{DATE_TOKEN}", re.I)
@@ -259,7 +252,7 @@ def extract_dates_from_html(html: str, url: str):
             if m:
                 updated = normalize_date(m.group(1)); source = "text:last-updated"; confidence = "medium"; break
 
-    # 5) <time datetime> with contextual words
+    # 5) <time datetime> with context
     if not updated:
         for t in soup.find_all("time"):
             dt_attr = t.get("datetime") or t.get("content")
@@ -285,12 +278,10 @@ def extract_dates_from_html(html: str, url: str):
             if val:
                 updated = normalize_date(val); source = "script:date-key"; confidence = "medium"
 
-    # Title
     title = ""
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
 
-    # Visible text hash
     txt_hash, excerpt = stable_text_hash(html)
     return updated, published, source, confidence, txt_hash, excerpt, title
 
@@ -302,7 +293,6 @@ def should_render(host: str, html_text: str) -> bool:
     host = (host or "").lower()
     if RENDER_DOMAINS and not any(host.endswith(d) or d in host for d in RENDER_DOMAINS):
         return False
-    # If it looks JS-driven, render; otherwise still render when enabled (conservative)
     if re.search(r"\bLoading\.\.\.|enable\s+javascript|enable\s+scripts|requires\s+javascript", html_text or "", re.I):
         return True
     return True
@@ -339,7 +329,6 @@ def process_url(url: str, base_timeout: int, gov_timeout: int):
     det_updated = det_published = upd_source = confidence = ""
 
     try:
-        # Prefer HEAD then GET; follow redirects manually up to 5
         try:
             r = sess.head(url, allow_redirects=False, timeout=timeout)
         except Exception as e:
@@ -374,7 +363,6 @@ def process_url(url: str, base_timeout: int, gov_timeout: int):
                 u, p, src, conf, t_hash, excerpt, t_title = extract_dates_from_html(html_text, final_url)
                 if t_title: title = t_title
 
-                # If no dates found OR page likely JS, render (if enabled)
                 if (not u and not p) and should_render(host, html_text):
                     try:
                         rendered = render_html_playwright(final_url, timeout_ms=int(timeout * 1000))
@@ -395,7 +383,6 @@ def process_url(url: str, base_timeout: int, gov_timeout: int):
                 notes.append(f"parse fail: {e.__class__.__name__}")
 
         elif code and 200 <= code < 300:
-            # Non-HTML (e.g., PDF) — hash first bytes for reference
             try:
                 if r.request.method == "HEAD":
                     rr = sess.get(final_url, allow_redirects=False, timeout=timeout, headers={"Range": "bytes=0-200000"})
@@ -406,7 +393,6 @@ def process_url(url: str, base_timeout: int, gov_timeout: int):
             except Exception as e:
                 notes.append(f"hash fail: {e.__class__.__name__}")
 
-        # Classify
         if code and 200 <= code < 300:
             status = "OK"; note = " | ".join(n for n in notes if n)
         elif code:
@@ -533,10 +519,10 @@ def _write_topic_area_summary(rows, results, tz_str: str):
     Build Slack text grouped by Column R ('Topic Area').
 
     Inclusion rule:
-      - ALWAYS include if Column K would be UPDATED this run (i.e., visible-text hash changed).
+      - ALWAYS include if Column K would be UPDATED this run (visible-text hash changed).
       - OTHERWISE, fall back to ALERT_MODE for date-driven inclusion:
           * "today_only": include if best date marker == today
-          * "both":       (since no text change) include only if best date marker == today
+          * "both":       include if best date marker == today
           * "text_change": exclude (no text change)
     """
     today = datetime.now(ZoneInfo(tz_str)).date().isoformat()
@@ -573,28 +559,17 @@ def _write_topic_area_summary(rows, results, tz_str: str):
         changed_text = bool(prev_text_hash) and bool(new_text_hash) and (new_text_hash != prev_text_hash)
 
         # Best local date marker for "today" checks
-        def _best_local_day(lastmod_iso, det_updated_iso, det_published_iso, tz):
-            for iso in (det_updated_iso, lastmod_iso, det_published_iso):
-                if not iso:
-                    continue
-                d = iso_to_local_day(iso, tz)
-                if d:
-                    return d
-            return ""
         best_day = _best_local_day(new_lastmod, new_det_upd, new_pub, tz_str)
         date_is_today = (best_day == today) if best_day else False
 
         # Inclusion gate:
         include = False
         if changed_text:
-            # ALWAYS include K-updates
             include = True
         else:
-            # No text change — decide based on alert mode (date-driven)
             if ALERT_MODE == "text_change":
                 include = False
             else:
-                # "today_only" or "both": include if date marker is today
                 include = bool(date_is_today)
 
         if not include:
@@ -612,60 +587,6 @@ def _write_topic_area_summary(rows, results, tz_str: str):
             tags.append(f"source updated: {new_src}")
         if new_pub and new_pub != prev_pub:
             tags.append(f"published: {new_pub}")
-
-        topic = (row[17] or "").strip() or "Uncategorised"  # Column R
-        groups.setdefault(topic, []).append({
-            "title": _sanitize_title_for_slack(title),
-            "url": url_a,
-            "tags": tags,
-        })
-        total_changes += 1
-
-    # Build Slack message text (your requested format)
-    lines = []
-    if total_changes:
-        lines.append("Here's the daily update on any new key resource changes:")
-        lines.append("")
-        for topic, items in groups.items():
-            if not items:
-                continue
-            n = len(items)
-            change_word = "change" if n == 1 else "changes"
-            lines.append(f"Topic Area: *{topic} (❗️{n} {change_word} detected)*")
-            for it in items:
-                link = f"<{it['url']}|{it['title']}>"
-                suffix = f", {', '.join(it['tags'])}" if it["tags"] else ""
-                lines.append(f"• {link}{suffix}")
-            lines.append("")
-
-    with open("topic_summary.json", "w", encoding="utf-8") as f:
-        json.dump({"date_local": today, "total_changes": total_changes, "groups": groups}, f, ensure_ascii=False, indent=2)
-    with open("topic_summary.md", "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) if lines else "")
-
-        def gate():
-            if ALERT_MODE == "text_change":
-                return changed_text
-            if ALERT_MODE == "today_only":
-                return date_is_today
-            # default: "both"
-            return changed_text and date_is_today
-
-        if not gate():
-            continue
-
-        # Build tags for labels that ALSO changed this run
-        tags = []
-        if new_lastmod and new_lastmod != prev_lastmod:
-            tags.append(f"modified: {new_lastmod}")
-        if new_raw_hash and new_raw_hash != prev_raw_hash:
-            tags.append("changed")
-        if new_det_updated and new_det_updated != prev_det_updated:
-            tags.append(f"updated: {new_det_updated}")
-        if new_src and new_src != prev_upd_source:
-            tags.append(f"source updated: {new_src}")
-        if new_published and new_published != prev_published:
-            tags.append(f"published: {new_published}")
 
         topic = (row[17] or "").strip() or "Uncategorised"  # Column R
         groups.setdefault(topic, []).append({
@@ -766,7 +687,6 @@ def main():
 # ===================== Runner =====================
 
 if __name__ == "__main__":
-    # Faster DNS failure
     socket.setdefaulttimeout(12)
 
     # Mirror logs to file for GitHub artifact
