@@ -531,10 +531,13 @@ def _best_local_day(lastmod_iso, det_updated_iso, det_published_iso, tz_str) -> 
 def _write_topic_area_summary(rows, results, tz_str: str):
     """
     Build Slack text grouped by Column R ('Topic Area').
-    Alert filters:
-      - "both": include only if (text-hash changed) AND (best date marker == today)
-      - "today_only": include only if (best date marker == today)
-      - "text_change": include only if (text-hash changed)
+
+    Inclusion rule:
+      - ALWAYS include if Column K would be UPDATED this run (i.e., visible-text hash changed).
+      - OTHERWISE, fall back to ALERT_MODE for date-driven inclusion:
+          * "today_only": include if best date marker == today
+          * "both":       (since no text change) include only if best date marker == today
+          * "text_change": exclude (no text change)
     """
     today = datetime.now(ZoneInfo(tz_str)).date().isoformat()
     groups = OrderedDict()
@@ -550,25 +553,95 @@ def _write_topic_area_summary(rows, results, tz_str: str):
         if status != "OK":
             continue
 
-        # Previous & new values
+        # previous vs new
         prev_text_hash = row[18] or ""
-        prev_lastmod = row[8] or ""
-        prev_det_updated = row[13] or ""
-        prev_published = row[15] or ""
-        prev_upd_source = row[14] or ""
-        prev_raw_hash = row[9] or ""
+        prev_lastmod   = row[8]  or ""
+        prev_det_upd   = row[13] or ""
+        prev_pub       = row[15] or ""
+        prev_src       = row[14] or ""
+        prev_raw_hash  = row[9]  or ""
 
-        new_text_hash = res.get("text_hash", "")
-        new_lastmod = res.get("lastmod", "")
-        new_det_updated = res.get("det_updated", "")
-        new_published = res.get("det_published", "")
-        new_src = res.get("upd_source", "")
-        new_raw_hash = res.get("content_hash", "")
-        title = (res.get("title") or row[4] or url_a).strip()
+        new_text_hash  = res.get("text_hash","")
+        new_lastmod    = res.get("lastmod","")
+        new_det_upd    = res.get("det_updated","")
+        new_pub        = res.get("det_published","")
+        new_src        = res.get("upd_source","")
+        new_raw_hash   = res.get("content_hash","")
+        title          = (res.get("title") or row[4] or url_a).strip()
 
+        # Column K logic: would this be UPDATED this run?
         changed_text = bool(prev_text_hash) and bool(new_text_hash) and (new_text_hash != prev_text_hash)
-        best_day = _best_local_day(new_lastmod, new_det_updated, new_published, tz_str)
+
+        # Best local date marker for "today" checks
+        def _best_local_day(lastmod_iso, det_updated_iso, det_published_iso, tz):
+            for iso in (det_updated_iso, lastmod_iso, det_published_iso):
+                if not iso:
+                    continue
+                d = iso_to_local_day(iso, tz)
+                if d:
+                    return d
+            return ""
+        best_day = _best_local_day(new_lastmod, new_det_upd, new_pub, tz_str)
         date_is_today = (best_day == today) if best_day else False
+
+        # Inclusion gate:
+        include = False
+        if changed_text:
+            # ALWAYS include K-updates
+            include = True
+        else:
+            # No text change — decide based on alert mode (date-driven)
+            if ALERT_MODE == "text_change":
+                include = False
+            else:
+                # "today_only" or "both": include if date marker is today
+                include = bool(date_is_today)
+
+        if not include:
+            continue
+
+        # Tag only the labels that ALSO changed this run
+        tags = []
+        if new_lastmod and new_lastmod != prev_lastmod:
+            tags.append(f"modified: {new_lastmod}")
+        if new_raw_hash and new_raw_hash != prev_raw_hash:
+            tags.append("changed")
+        if new_det_upd and new_det_upd != prev_det_upd:
+            tags.append(f"updated: {new_det_upd}")
+        if new_src and new_src != prev_src:
+            tags.append(f"source updated: {new_src}")
+        if new_pub and new_pub != prev_pub:
+            tags.append(f"published: {new_pub}")
+
+        topic = (row[17] or "").strip() or "Uncategorised"  # Column R
+        groups.setdefault(topic, []).append({
+            "title": _sanitize_title_for_slack(title),
+            "url": url_a,
+            "tags": tags,
+        })
+        total_changes += 1
+
+    # Build Slack message text (your requested format)
+    lines = []
+    if total_changes:
+        lines.append("Here's the daily update on any new key resource changes:")
+        lines.append("")
+        for topic, items in groups.items():
+            if not items:
+                continue
+            n = len(items)
+            change_word = "change" if n == 1 else "changes"
+            lines.append(f"Topic Area: *{topic} (❗️{n} {change_word} detected)*")
+            for it in items:
+                link = f"<{it['url']}|{it['title']}>"
+                suffix = f", {', '.join(it['tags'])}" if it["tags"] else ""
+                lines.append(f"• {link}{suffix}")
+            lines.append("")
+
+    with open("topic_summary.json", "w", encoding="utf-8") as f:
+        json.dump({"date_local": today, "total_changes": total_changes, "groups": groups}, f, ensure_ascii=False, indent=2)
+    with open("topic_summary.md", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) if lines else "")
 
         def gate():
             if ALERT_MODE == "text_change":
